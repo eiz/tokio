@@ -1,5 +1,5 @@
 #![warn(rust_2018_idioms)]
-#![cfg(feature = "full")]
+#![cfg(all(feature = "full", feature = "process"))]
 
 use std::cell::Cell;
 use std::io::Cursor;

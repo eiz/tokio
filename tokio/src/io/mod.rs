@@ -174,7 +174,7 @@ cfg_io_driver! {
     pub(crate) mod driver;
 
     mod poll_evented;
-    pub use poll_evented::PollEvented;
+    pub use poll_evented::PollSource;
 
     mod registration;
     pub use registration::Registration;

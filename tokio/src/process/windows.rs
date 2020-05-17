@@ -15,7 +15,7 @@
 //! `RegisterWaitForSingleObject` and then wait on the other end of the oneshot
 //! from then on out.
 
-use crate::io::PollEvented;
+use crate::io::PollSource;
 use crate::process::kill::Kill;
 use crate::process::SpawnedChild;
 use crate::sync::oneshot;
@@ -174,11 +174,11 @@ pub(crate) fn try_wait(child: &StdChild) -> io::Result<Option<ExitStatus>> {
     }
 }
 
-pub(crate) type ChildStdin = PollEvented<NamedPipe>;
-pub(crate) type ChildStdout = PollEvented<NamedPipe>;
-pub(crate) type ChildStderr = PollEvented<NamedPipe>;
+pub(crate) type ChildStdin = PollSource<NamedPipe>;
+pub(crate) type ChildStdout = PollSource<NamedPipe>;
+pub(crate) type ChildStderr = PollSource<NamedPipe>;
 
-fn stdio<T>(option: Option<T>) -> Option<PollEvented<NamedPipe>>
+fn stdio<T>(option: Option<T>) -> Option<PollSource<NamedPipe>>
 where
     T: IntoRawHandle,
 {
@@ -187,5 +187,5 @@ where
         None => return None,
     };
     let pipe = unsafe { NamedPipe::from_raw_handle(io.into_raw_handle()) };
-    PollEvented::new(pipe).ok()
+    PollSource::new(pipe).ok()
 }

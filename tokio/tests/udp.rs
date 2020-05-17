@@ -46,7 +46,7 @@ async fn split() -> std::io::Result<()> {
     let msg = b"hello";
     let addr = s.as_ref().local_addr()?;
     tokio::spawn(async move {
-        s.send_to(msg, &addr).await.unwrap();
+        s.send_to(msg, addr).await.unwrap();
     });
     let mut recv_buf = [0u8; 32];
     let (len, _) = r.recv_from(&mut recv_buf[..]).await?;

@@ -1,5 +1,3 @@
-pub(crate) mod platform;
-
 mod scheduled_io;
 pub(crate) use scheduled_io::ScheduledIo; // pub(crate) for tests
 
@@ -8,11 +6,11 @@ use crate::park::{Park, Unpark};
 use crate::runtime::context;
 use crate::util::slab::{Address, Slab};
 
-use mio::event::Evented;
+use mio::event::Source;
 use std::fmt;
 use std::io;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::Waker;
 use std::time::Duration;
 
@@ -21,10 +19,11 @@ pub(crate) struct Driver {
     /// Reuse the `mio::Events` value across calls to poll.
     events: mio::Events,
 
+    /// The underlying system event queue.
+    io: mio::Poll,
+
     /// State shared between the reactor and the handles.
     inner: Arc<Inner>,
-
-    _wakeup_registration: mio::Registration,
 }
 
 /// A reference to an I/O driver
@@ -34,8 +33,7 @@ pub(crate) struct Handle {
 }
 
 pub(super) struct Inner {
-    /// The underlying system event queue.
-    io: mio::Poll,
+    registry: mio::Registry,
 
     /// Dispatch slabs for I/O and futures events
     pub(super) io_dispatch: Slab<ScheduledIo>,
@@ -44,7 +42,7 @@ pub(super) struct Inner {
     n_sources: AtomicUsize,
 
     /// Used to wake up the reactor from a call to `turn`
-    wakeup: mio::SetReadiness,
+    wakeup: mio::Waker,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -61,6 +59,28 @@ fn _assert_kinds() {
     _assert::<Handle>();
 }
 
+pub(crate) const READY_READ: usize = 1;
+pub(crate) const READY_WRITE: usize = 2;
+pub(crate) const READY_ERROR: usize = 4;
+
+fn event_as_readiness(event: &mio::event::Event) -> usize {
+    let mut result = 0;
+
+    if event.is_write_closed() || event.is_error() || event.is_read_closed() {
+        result |= READY_ERROR;
+    }
+
+    if event.is_writable() {
+        result |= READY_WRITE;
+    }
+
+    if event.is_readable() {
+        result |= READY_READ;
+    }
+
+    result
+}
+
 // ===== impl Driver =====
 
 impl Driver {
@@ -68,23 +88,17 @@ impl Driver {
     /// creation.
     pub(crate) fn new() -> io::Result<Driver> {
         let io = mio::Poll::new()?;
-        let wakeup_pair = mio::Registration::new2();
-
-        io.register(
-            &wakeup_pair.0,
-            TOKEN_WAKEUP,
-            mio::Ready::readable(),
-            mio::PollOpt::level(),
-        )?;
+        let registry = io.registry().try_clone()?;
+        let waker = mio::Waker::new(io.registry(), TOKEN_WAKEUP)?;
 
         Ok(Driver {
             events: mio::Events::with_capacity(1024),
-            _wakeup_registration: wakeup_pair.0,
+            io,
             inner: Arc::new(Inner {
-                io,
+                registry,
                 io_dispatch: Slab::new(),
                 n_sources: AtomicUsize::new(0),
-                wakeup: wakeup_pair.1,
+                wakeup: waker,
             }),
         })
     }
@@ -104,34 +118,26 @@ impl Driver {
     fn turn(&mut self, max_wait: Option<Duration>) -> io::Result<()> {
         // Block waiting for an event to happen, peeling out how many events
         // happened.
-        match self.inner.io.poll(&mut self.events, max_wait) {
+        match self.io.poll(&mut self.events, max_wait) {
             Ok(_) => {}
             Err(e) => return Err(e),
         }
 
         // Process all the events that came in, dispatching appropriately
-
         for event in self.events.iter() {
-            let token = event.token();
-
-            if token == TOKEN_WAKEUP {
-                self.inner
-                    .wakeup
-                    .set_readiness(mio::Ready::empty())
-                    .unwrap();
-            } else {
-                self.dispatch(token, event.readiness());
+            if event.token() != TOKEN_WAKEUP {
+                self.dispatch(event);
             }
         }
 
         Ok(())
     }
 
-    fn dispatch(&self, token: mio::Token, ready: mio::Ready) {
+    fn dispatch(&self, event: &mio::event::Event) {
         let mut rd = None;
         let mut wr = None;
 
-        let address = Address::from_usize(token.0);
+        let address = Address::from_usize(event.token().0);
 
         let io = match self.inner.io_dispatch.get(address) {
             Some(io) => io,
@@ -139,18 +145,18 @@ impl Driver {
         };
 
         if io
-            .set_readiness(address, |curr| curr | ready.as_usize())
+            .set_readiness(address, |curr| curr | event_as_readiness(event))
             .is_err()
         {
             // token no longer valid!
             return;
         }
 
-        if ready.is_writable() || platform::is_hup(ready) || platform::is_error(ready) {
+        if event.is_writable() || event.is_write_closed() || event.is_error() {
             wr = io.writer.take_waker();
         }
 
-        if !(ready & (!mio::Ready::writable())).is_empty() {
+        if event.is_readable() || event.is_read_closed() || event.is_error() {
             rd = io.reader.take_waker();
         }
 
@@ -213,7 +219,7 @@ impl Handle {
     /// return immediately.
     fn wakeup(&self) {
         if let Some(inner) = self.inner() {
-            inner.wakeup.set_readiness(mio::Ready::readable()).unwrap();
+            inner.wakeup.wake().unwrap();
         }
     }
 
@@ -240,7 +246,7 @@ impl Inner {
     /// Registers an I/O resource with the reactor.
     ///
     /// The registration token is returned.
-    pub(super) fn add_source(&self, source: &dyn Evented) -> io::Result<Address> {
+    pub(super) fn add_source(&self, source: &mut dyn Source) -> io::Result<Address> {
         let address = self.io_dispatch.alloc().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -250,19 +256,18 @@ impl Inner {
 
         self.n_sources.fetch_add(1, SeqCst);
 
-        self.io.register(
+        self.registry.register(
             source,
             mio::Token(address.to_usize()),
-            mio::Ready::all(),
-            mio::PollOpt::edge(),
+            mio::Interest::READABLE.add(mio::Interest::WRITABLE),
         )?;
 
         Ok(address)
     }
 
     /// Deregisters an I/O resource from the reactor.
-    pub(super) fn deregister_source(&self, source: &dyn Evented) -> io::Result<()> {
-        self.io.deregister(source)
+    pub(super) fn deregister_source(&self, source: &mut dyn Source) -> io::Result<()> {
+        self.registry.deregister(source)
     }
 
     pub(super) fn drop_source(&self, address: Address) {
@@ -287,13 +292,10 @@ impl Inner {
 }
 
 impl Direction {
-    pub(super) fn mask(self) -> mio::Ready {
+    pub(super) fn mask(self) -> usize {
         match self {
-            Direction::Read => {
-                // Everything except writable is signaled through read.
-                mio::Ready::all() - mio::Ready::writable()
-            }
-            Direction::Write => mio::Ready::writable() | platform::hup() | platform::error(),
+            Direction::Read => READY_READ | READY_ERROR,
+            Direction::Write => READY_WRITE | READY_ERROR,
         }
     }
 }
@@ -303,10 +305,10 @@ mod tests {
     use super::*;
     use loom::thread;
 
-    // No-op `Evented` impl just so we can have something to pass to `add_source`.
-    struct NotEvented;
+    // No-op `Source` impl just so we can have something to pass to `add_source`.
+    struct NotSource;
 
-    impl Evented for NotEvented {
+    impl Source for NotSource {
         fn register(
             &self,
             _: &mio::Poll,
@@ -339,12 +341,12 @@ mod tests {
             let inner = reactor.inner;
             let inner2 = inner.clone();
 
-            let token_1 = inner.add_source(&NotEvented).unwrap();
+            let token_1 = inner.add_source(&NotSource).unwrap();
             let thread = thread::spawn(move || {
                 inner2.drop_source(token_1);
             });
 
-            let token_2 = inner.add_source(&NotEvented).unwrap();
+            let token_2 = inner.add_source(&NotSource).unwrap();
             thread.join().unwrap();
 
             assert!(token_1 != token_2);
@@ -360,15 +362,15 @@ mod tests {
             // add sources to fill up the first page so that the dropped index
             // may be reused.
             for _ in 0..31 {
-                inner.add_source(&NotEvented).unwrap();
+                inner.add_source(&NotSource).unwrap();
             }
 
-            let token_1 = inner.add_source(&NotEvented).unwrap();
+            let token_1 = inner.add_source(&NotSource).unwrap();
             let thread = thread::spawn(move || {
                 inner2.drop_source(token_1);
             });
 
-            let token_2 = inner.add_source(&NotEvented).unwrap();
+            let token_2 = inner.add_source(&NotSource).unwrap();
             thread.join().unwrap();
 
             assert!(token_1 != token_2);
@@ -383,11 +385,11 @@ mod tests {
             let inner2 = inner.clone();
 
             let thread = thread::spawn(move || {
-                let token_2 = inner2.add_source(&NotEvented).unwrap();
+                let token_2 = inner2.add_source(&NotSource).unwrap();
                 token_2
             });
 
-            let token_1 = inner.add_source(&NotEvented).unwrap();
+            let token_1 = inner.add_source(&NotSource).unwrap();
             let token_2 = thread.join().unwrap();
 
             assert!(token_1 != token_2);

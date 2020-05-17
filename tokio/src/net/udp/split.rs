@@ -119,7 +119,7 @@ impl SendHalf {
     ///
     /// The future will resolve to an error if the IP version of the socket does
     /// not match that of `target`.
-    pub async fn send_to(&mut self, buf: &[u8], target: &SocketAddr) -> io::Result<usize> {
+    pub async fn send_to(&mut self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         poll_fn(|cx| self.0.poll_send_to(cx, buf, target)).await
     }
 

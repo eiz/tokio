@@ -1,5 +1,5 @@
 #![warn(rust_2018_idioms)]
-#![cfg(feature = "full")]
+#![cfg(feature = "process")]
 
 use tokio::process::Command;
 use tokio_test::assert_ok;

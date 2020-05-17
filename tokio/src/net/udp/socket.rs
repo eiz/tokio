@@ -1,5 +1,5 @@
 use crate::future::poll_fn;
-use crate::io::PollEvented;
+use crate::io::PollSource;
 use crate::net::udp::split::{split, RecvHalf, SendHalf};
 use crate::net::ToSocketAddrs;
 
@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 cfg_udp! {
     /// A UDP socket
     pub struct UdpSocket {
-        io: PollEvented<mio::net::UdpSocket>,
+        io: PollSource<mio::net::UdpSocket>,
     }
 }
 
@@ -39,12 +39,12 @@ impl UdpSocket {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<UdpSocket> {
-        let sys = mio::net::UdpSocket::bind(&addr)?;
+        let sys = mio::net::UdpSocket::bind(addr)?;
         UdpSocket::new(sys)
     }
 
     fn new(socket: mio::net::UdpSocket) -> io::Result<UdpSocket> {
-        let io = PollEvented::new(socket)?;
+        let io = PollSource::new(socket)?;
         Ok(UdpSocket { io })
     }
 
@@ -66,8 +66,8 @@ impl UdpSocket {
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Handle::enter`](crate::runtime::Handle::enter) function.
     pub fn from_std(socket: net::UdpSocket) -> io::Result<UdpSocket> {
-        let io = mio::net::UdpSocket::from_socket(socket)?;
-        let io = PollEvented::new(io)?;
+        let io = mio::net::UdpSocket::from_std(socket);
+        let io = PollSource::new(io)?;
         Ok(UdpSocket { io })
     }
 
@@ -118,11 +118,11 @@ impl UdpSocket {
 
     // Poll IO functions that takes `&self` are provided for the split API.
     //
-    // They are not public because (taken from the doc of `PollEvented`):
+    // They are not public because (taken from the doc of `PollSource`):
     //
-    // While `PollEvented` is `Sync` (if the underlying I/O type is `Sync`), the
+    // While `PollSource` is `Sync` (if the underlying I/O type is `Sync`), the
     // caller must ensure that there are at most two tasks that use a
-    // `PollEvented` instance concurrently. One for reading and one for writing.
+    // `PollSource` instance concurrently. One for reading and one for writing.
     // While violating this requirement is "safe" from a Rust memory model point
     // of view, it will result in unexpected behavior in the form of lost
     // notifications and tasks hanging.
@@ -157,11 +157,11 @@ impl UdpSocket {
 
     #[doc(hidden)]
     pub fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
-        ready!(self.io.poll_read_ready(cx, mio::Ready::readable()))?;
+        ready!(self.io.poll_read_ready(cx))?;
 
         match self.io.get_ref().recv(buf) {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.clear_read_ready(cx, mio::Ready::readable())?;
+                self.io.clear_read_ready(cx)?;
                 Poll::Pending
             }
             x => Poll::Ready(x),
@@ -177,7 +177,7 @@ impl UdpSocket {
         let mut addrs = target.to_socket_addrs().await?;
 
         match addrs.next() {
-            Some(target) => poll_fn(|cx| self.poll_send_to(cx, buf, &target)).await,
+            Some(target) => poll_fn(|cx| self.poll_send_to(cx, buf, target)).await,
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no addresses to send data to",
@@ -191,7 +191,7 @@ impl UdpSocket {
         &self,
         cx: &mut Context<'_>,
         buf: &[u8],
-        target: &SocketAddr,
+        target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
         ready!(self.io.poll_write_ready(cx))?;
 
@@ -220,11 +220,11 @@ impl UdpSocket {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<(usize, SocketAddr), io::Error>> {
-        ready!(self.io.poll_read_ready(cx, mio::Ready::readable()))?;
+        ready!(self.io.poll_read_ready(cx))?;
 
         match self.io.get_ref().recv_from(buf) {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.clear_read_ready(cx, mio::Ready::readable())?;
+                self.io.clear_read_ready(cx)?;
                 Poll::Pending
             }
             x => Poll::Ready(x),
@@ -371,10 +371,10 @@ impl TryFrom<UdpSocket> for mio::net::UdpSocket {
 
     /// Consumes value, returning the mio I/O object.
     ///
-    /// See [`PollEvented::into_inner`] for more details about
+    /// See [`PollSource::into_inner`] for more details about
     /// resource deregistration that happens during the call.
     ///
-    /// [`PollEvented::into_inner`]: crate::io::PollEvented::into_inner
+    /// [`PollSource::into_inner`]: crate::io::PollSource::into_inner
     fn try_from(value: UdpSocket) -> Result<Self, Self::Error> {
         value.io.into_inner()
     }

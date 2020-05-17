@@ -828,7 +828,7 @@ rt_test! {
                 tokio::spawn(async move {
                     let buf = [0];
                     loop {
-                        send_half.send_to(&buf, &addr).await.unwrap();
+                        send_half.send_to(&buf, addr).await.unwrap();
                         tokio::time::delay_for(Duration::from_millis(1)).await;
                     }
                 });

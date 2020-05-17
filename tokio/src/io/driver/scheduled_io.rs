@@ -1,3 +1,4 @@
+use crate::io::driver::{READY_ERROR, READY_READ, READY_WRITE};
 use crate::loom::future::AtomicWaker;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::util::bit;
@@ -107,7 +108,7 @@ impl ScheduledIo {
             }
             // Mask out the generation bits so that the modifying function
             // doesn't see them.
-            let current_readiness = current & mio::Ready::all().as_usize();
+            let current_readiness = current & (READY_READ | READY_WRITE | READY_ERROR);
             let new = f(current_readiness);
 
             debug_assert!(

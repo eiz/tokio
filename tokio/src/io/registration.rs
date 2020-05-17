@@ -1,7 +1,7 @@
-use crate::io::driver::{platform, Direction, Handle};
+use crate::io::driver::{Direction, Handle, READY_ERROR};
 use crate::util::slab::Address;
 
-use mio::{self, Evented};
+use mio::{self, event::Source};
 use std::io;
 use std::task::{Context, Poll};
 
@@ -62,9 +62,9 @@ impl Registration {
     /// The runtime is usually set implicitly when this function is called
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Handle::enter`](crate::runtime::Handle::enter) function.
-    pub fn new<T>(io: &T) -> io::Result<Registration>
+    pub fn new<T>(io: &mut T) -> io::Result<Registration>
     where
-        T: Evented,
+        T: Source,
     {
         let handle = Handle::current();
         let address = if let Some(inner) = handle.inner() {
@@ -95,9 +95,9 @@ impl Registration {
     /// no longer result in notifications getting sent for this registration.
     ///
     /// `Err` is returned if an error is encountered.
-    pub fn deregister<T>(&mut self, io: &T) -> io::Result<()>
+    pub fn deregister<T>(&mut self, io: &mut T) -> io::Result<()>
     where
-        T: Evented,
+        T: Source,
     {
         let inner = match self.handle.inner() {
             Some(inner) => inner,
@@ -138,7 +138,7 @@ impl Registration {
     /// # Panics
     ///
     /// This function will panic if called from outside of a task context.
-    pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<mio::Ready>> {
+    pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         // Keep track of task budget
         ready!(crate::coop::poll_proceed(cx));
 
@@ -156,7 +156,7 @@ impl Registration {
     /// it is safe to call this function from outside of a task context.
     ///
     /// [`poll_read_ready`]: #method.poll_read_ready
-    pub fn take_read_ready(&self) -> io::Result<Option<mio::Ready>> {
+    pub fn take_read_ready(&self) -> io::Result<Option<usize>> {
         self.poll_ready(Direction::Read, None)
     }
 
@@ -192,7 +192,7 @@ impl Registration {
     /// # Panics
     ///
     /// This function will panic if called from outside of a task context.
-    pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<mio::Ready>> {
+    pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         // Keep track of task budget
         ready!(crate::coop::poll_proceed(cx));
 
@@ -210,7 +210,7 @@ impl Registration {
     /// it is safe to call this function from outside of a task context.
     ///
     /// [`poll_write_ready`]: #method.poll_write_ready
-    pub fn take_write_ready(&self) -> io::Result<Option<mio::Ready>> {
+    pub fn take_write_ready(&self) -> io::Result<Option<usize>> {
         self.poll_ready(Direction::Write, None)
     }
 
@@ -222,7 +222,7 @@ impl Registration {
         &self,
         direction: Direction,
         cx: Option<&mut Context<'_>>,
-    ) -> io::Result<Option<mio::Ready>> {
+    ) -> io::Result<Option<usize>> {
         let inner = match self.handle.inner() {
             Some(inner) => inner,
             None => return Err(io::Error::new(io::ErrorKind::Other, "reactor gone")),
@@ -235,7 +235,7 @@ impl Registration {
         }
 
         let mask = direction.mask();
-        let mask_no_hup = (mask - platform::hup() - platform::error()).as_usize();
+        let mask_no_hup = mask & !READY_ERROR;
 
         let sched = inner.io_dispatch.get(self.address).unwrap();
 
@@ -259,9 +259,9 @@ impl Registration {
             .set_readiness(self.address, |curr| curr & (!mask_no_hup))
             .unwrap_or_else(|_| panic!("address {:?} no longer valid!", self.address));
 
-        let mut ready = mask & mio::Ready::from_usize(curr_ready);
+        let mut ready = mask & curr_ready;
 
-        if ready.is_empty() {
+        if ready == 0 {
             if let Some(cx) = cx {
                 // Update the task info
                 match direction {
@@ -273,11 +273,11 @@ impl Registration {
                 let curr_ready = sched
                     .set_readiness(self.address, |curr| curr & (!mask_no_hup))
                     .unwrap_or_else(|_| panic!("address {:?} no longer valid!", self.address));
-                ready = mask & mio::Ready::from_usize(curr_ready);
+                ready = mask & curr_ready;
             }
         }
 
-        if ready.is_empty() {
+        if ready == 0 {
             Ok(None)
         } else {
             Ok(Some(ready))
